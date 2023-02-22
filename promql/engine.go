@@ -36,6 +36,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/exp/slices"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
@@ -58,6 +59,8 @@ const (
 	maxInt64 = 9223372036854774784
 	// The smallest SampleValue that can be converted to an int64 without underflow.
 	minInt64 = -9223372036854775808
+
+	queryConcurrencySize = 16
 )
 
 type engineMetrics struct {
@@ -955,6 +958,21 @@ type evaluator struct {
 	lookbackDelta            time.Duration
 	samplesStats             *stats.QuerySamples
 	noStepSubqueryIntervalFn func(rangeMillis int64) int64
+
+	memoizedSeriesIteratorPool sync.Pool
+}
+
+func (ev *evaluator) getMemoizedEmptyIterator() *storage.MemoizedSeriesIterator {
+	m := ev.memoizedSeriesIteratorPool.Get()
+	if m != nil {
+		return m.(*storage.MemoizedSeriesIterator)
+	}
+	return storage.NewMemoizedEmptyIterator(durationMilliseconds(ev.lookbackDelta))
+}
+
+func (ev *evaluator) putMemoizedEmptyIterator(it *storage.MemoizedSeriesIterator) {
+	it.Reset(chunkenc.NewNopIterator())
+	ev.memoizedSeriesIteratorPool.Put(it)
 }
 
 // errorf causes a panic with the input formatted into an error.
@@ -1587,36 +1605,72 @@ func (ev *evaluator) eval(expr parser.Expr) (parser.Value, storage.Warnings) {
 			ev.error(errWithWarnings{fmt.Errorf("expanding series: %w", err), ws})
 		}
 		mat := make(Matrix, 0, len(e.Series))
-		it := storage.NewMemoizedEmptyIterator(durationMilliseconds(ev.lookbackDelta))
-		var chkIter chunkenc.Iterator
-		for i, s := range e.Series {
-			chkIter = s.Iterator(chkIter)
-			it.Reset(chkIter)
-			ss := Series{
-				Metric: e.Series[i].Labels(),
-				Points: getPointSlice(numSteps),
-			}
 
-			for ts, step := ev.startTimestamp, -1; ts <= ev.endTimestamp; ts += ev.interval {
-				step++
-				_, v, h, ok := ev.vectorSelectorSingle(it, e, ts)
-				if ok {
-					if ev.currentSamples < ev.maxSamples {
-						ss.Points = append(ss.Points, Point{V: v, H: h, T: ts})
-						ev.samplesStats.IncrementSamplesAtStep(step, 1)
-						ev.currentSamples++
+		group, groupCtx := errgroup.WithContext(ev.ctx)
+		group.SetLimit(queryConcurrencySize)
+		seriesCh := make(chan *Series, queryConcurrencySize)
+		wg := sync.WaitGroup{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for sw := range seriesCh {
+				// error of chunk read and client send is processed unified, and have goroutine
+				if ev.ctx.Err() != nil {
+					return
+				}
+				if sw != nil {
+					for step := range sw.Points {
+						if ev.currentSamples < ev.maxSamples {
+							ev.currentSamples++
+							ev.samplesStats.IncrementSamplesAtStep(step, 1)
+						} else {
+							err = ErrTooManySamples(env)
+						}
+					}
+					if len(sw.Points) > 0 {
+						mat = append(mat, *sw)
 					} else {
-						ev.error(ErrTooManySamples(env))
+						putPointSlice(sw.Points)
 					}
 				}
 			}
+		}()
 
-			if len(ss.Points) > 0 {
-				mat = append(mat, ss)
-			} else {
-				putPointSlice(ss.Points)
-			}
+		for i, s := range e.Series {
+			tti := i
+			tts := s
+
+			group.Go(func() error {
+				if groupCtx.Err() != nil {
+					return nil
+				}
+				it := ev.getMemoizedEmptyIterator()
+				defer ev.putMemoizedEmptyIterator(it)
+				var chunkIter chunkenc.Iterator
+				it.Reset(tts.Iterator(chunkIter))
+				ss := Series{
+					Metric: e.Series[tti].Labels(),
+					Points: getPointSlice(numSteps),
+				}
+				for ts := ev.startTimestamp; ts <= ev.endTimestamp; ts += ev.interval {
+					_, v, h, ok := ev.vectorSelectorSingle(it, e, ts)
+					if ok {
+						ss.Points = append(ss.Points, Point{V: v, H: h, T: ts})
+					}
+				}
+				seriesCh <- &ss
+				return nil
+			})
 		}
+		if groupErr := group.Wait(); groupErr != nil {
+			err = groupErr
+		}
+		close(seriesCh)
+		wg.Wait()
+		if err != nil {
+			ev.error(err)
+		}
+		sort.Sort(mat)
 		ev.samplesStats.UpdatePeak(ev.currentSamples)
 		return mat, ws
 
